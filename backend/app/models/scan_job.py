@@ -38,7 +38,14 @@ class ScanJob(Base):
     )
 
     status: Mapped[ScanStatus] = mapped_column(
-        Enum(ScanStatus), nullable=False, default=ScanStatus.PENDING
+        # values_callable is required so SQLAlchemy stores/reads the enum's
+        # .value ("pending") rather than its .name ("PENDING"). Without this,
+        # SQLAlchemy defaults to persisting member NAMES, which do not match
+        # the lowercase values already defined in the Postgres enum type
+        # (see alembic/versions/0002_scan_jobs.py).
+        Enum(ScanStatus, values_callable=lambda enum_cls: [member.value for member in enum_cls]),
+        nullable=False,
+        default=ScanStatus.PENDING,
     )
 
     candidate_emails_found: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

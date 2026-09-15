@@ -10,6 +10,7 @@ import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.oauth import build_authorization_url, exchange_code_for_credentials, credentials_expiry
@@ -46,23 +47,54 @@ async def google_callback(request: Request, code: str, state: str, db: AsyncSess
 
     email = get_verified_email(credentials)
 
-    result = await db.execute(User.__table__.select().where(User.email == email))
-    user_row = result.first()
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
 
-    if user_row is None:
+    if user is None:
         user = User(email=email)
         db.add(user)
         await db.flush()
-    else:
-        user = user_row
 
-    token = OAuthToken(
-        user_id=user.id,
-        encrypted_access_token=encrypt_token(credentials.token),
-        encrypted_refresh_token=encrypt_token(credentials.refresh_token),
-        expires_at=credentials_expiry(credentials),
-    )
-    db.add(token)
+    # oauth_tokens.user_id has a unique constraint - one token record per
+    # user, by design. On reconnect, update the existing row instead of
+    # inserting a second one (which would violate that constraint).
+    result = await db.execute(select(OAuthToken).where(OAuthToken.user_id == user.id))
+    existing_token = result.scalar_one_or_none()
+
+    encrypted_access_token = encrypt_token(credentials.token)
+    expires_at = credentials_expiry(credentials)
+
+    # Google only returns a refresh_token on some authorizations (typically
+    # the first consent, or subsequent ones only if the flow forces
+    # prompt=consent, which build_authorization_url already does - but we
+    # stay defensive here in case Google omits it on a given reconnect).
+    # Never overwrite a valid stored refresh token with nothing.
+    if credentials.refresh_token:
+        encrypted_refresh_token = encrypt_token(credentials.refresh_token)
+    elif existing_token is not None:
+        encrypted_refresh_token = existing_token.encrypted_refresh_token
+    else:
+        # No existing token to fall back on and Google didn't send one -
+        # we can't proceed without a refresh token for future scans.
+        raise HTTPException(
+            status_code=400,
+            detail="Google did not return a refresh token. Please reconnect and grant access again.",
+        )
+
+    if existing_token is not None:
+        existing_token.encrypted_access_token = encrypted_access_token
+        existing_token.encrypted_refresh_token = encrypted_refresh_token
+        existing_token.expires_at = expires_at
+    else:
+        db.add(
+            OAuthToken(
+                user_id=user.id,
+                encrypted_access_token=encrypted_access_token,
+                encrypted_refresh_token=encrypted_refresh_token,
+                expires_at=expires_at,
+            )
+        )
+
     await db.commit()
 
     request.session["user_id"] = str(user.id)
